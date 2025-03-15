@@ -1,0 +1,19 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Configure build arguments as needed
+        MINIMUM_BUILD: "false"
+        USE_CUDA: "false"
+        USE_CUDA_VER: "cpu"
+        PIPELINES_URLS: ""
+        PIPELINES_REQUIREMENTS_PATH: ""
+    ports:
+      - "9099:9099"
+    env_file:
+      - ./.env
+    restart: unless-stopped
+    # If you need to set custom command instead of the ENTRYPOINT
+    # command: bash start.sh --additional-args
