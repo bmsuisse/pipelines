@@ -64,8 +64,3 @@ beautifulsoup4
 # Llama Index for RAG
 llama-index
 llama-index-llms-ollama
-
-langchain
-langchain-core
-langgraph
-langchain-openai
