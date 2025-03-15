@@ -668,24 +668,67 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
             detail=f"Pipeline {form_data.model} not found",
         )
 
-    # Get the pipeline details
     pipeline = app.state.PIPELINES[form_data.model]
     pipeline_id = form_data.model
 
-    # Get the appropriate pipe function
     if pipeline["type"] == "manifold":
         manifold_id, pipeline_id = pipeline_id.split(".", 1)
         pipe = PIPELINE_MODULES[manifold_id].pipe
     else:
         pipe = PIPELINE_MODULES[pipeline_id].pipe
 
-    # Check if pipe is async or sync
     is_async = inspect.iscoroutinefunction(pipe)
+    is_async_gen = inspect.isasyncgenfunction(pipe)
+    
+    # Helper function to ensure line is a string
+    def ensure_string(line):
+        if isinstance(line, bytes):
+            return line.decode("utf-8")
+        return str(line)
     
     if form_data.stream:
         async def stream_content():
-            # Handle async pipe
-            if is_async:
+            if is_async_gen:
+                pipe_gen = pipe(
+                    user_message=user_message,
+                    model_id=pipeline_id,
+                    messages=messages,
+                    body=form_data.model_dump(),
+                )
+                
+                async for line in pipe_gen:
+                    if isinstance(line, BaseModel):
+                        line = line.model_dump_json()
+                        line = f"data: {line}"
+                    
+                    line = ensure_string(line)
+                    logging.info(f"stream_content:AsyncGeneratorFunction:{line}")
+                    
+                    if line.startswith("data:"):
+                        yield f"{line}\n\n"
+                    else:
+                        line = stream_message_template(form_data.model, line)
+                        yield f"data: {json.dumps(line)}\n\n"
+                
+                finish_message = {
+                    "id": f"{form_data.model}-{str(uuid.uuid4())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": form_data.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "logprobs": None,
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+                
+                yield f"data: {json.dumps(finish_message)}\n\n"
+                yield f"data: [DONE]"
+            
+            elif is_async:
                 res = await pipe(
                     user_message=user_message,
                     model_id=pipeline_id,
@@ -695,24 +738,18 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                 
                 logging.info(f"stream:true:async:{res}")
                 
-                # Handle async string response
                 if isinstance(res, str):
                     message = stream_message_template(form_data.model, res)
                     logging.info(f"stream_content:str:async:{message}")
                     yield f"data: {json.dumps(message)}\n\n"
                 
-                # Handle async generators/iterators
                 elif inspect.isasyncgen(res):
                     async for line in res:
                         if isinstance(line, BaseModel):
                             line = line.model_dump_json()
                             line = f"data: {line}"
                         
-                        try:
-                            line = line.decode("utf-8")
-                        except:
-                            pass
-                        
+                        line = ensure_string(line)
                         logging.info(f"stream_content:AsyncGenerator:{line}")
                         
                         if line.startswith("data:"):
@@ -721,7 +758,6 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                             line = stream_message_template(form_data.model, line)
                             yield f"data: {json.dumps(line)}\n\n"
                 
-                # Send finish message for async responses
                 if isinstance(res, str) or inspect.isasyncgen(res):
                     finish_message = {
                         "id": f"{form_data.model}-{str(uuid.uuid4())}",
@@ -741,9 +777,7 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                     yield f"data: {json.dumps(finish_message)}\n\n"
                     yield f"data: [DONE]"
             
-            # Handle sync pipe (existing implementation)
             else:
-                # Use a threadpool for synchronous functions to avoid blocking
                 def sync_job():
                     res = pipe(
                         user_message=user_message,
@@ -767,11 +801,7 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                             line = line.model_dump_json()
                             line = f"data: {line}"
                         
-                        try:
-                            line = line.decode("utf-8")
-                        except:
-                            pass
-                        
+                        line = ensure_string(line)
                         logging.info(f"stream_content:Generator:{line}")
                         
                         if line.startswith("data:"):
@@ -801,9 +831,38 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
         
         return StreamingResponse(stream_content(), media_type="text/event-stream")
     else:
-        # Non-streaming response
-        if is_async:
-            # Handle async pipe for non-streaming case
+        if is_async_gen:
+            pipe_gen = pipe(
+                user_message=user_message,
+                model_id=pipeline_id,
+                messages=messages,
+                body=form_data.model_dump(),
+            )
+            
+            message = ""
+            async for stream in pipe_gen:
+                stream = ensure_string(stream)
+                message = f"{message}{stream}"
+            
+            logging.info(f"stream:false:async_gen_function:{message}")
+            return {
+                "id": f"{form_data.model}-{str(uuid.uuid4())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": form_data.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": message,
+                        },
+                        "logprobs": None,
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        elif is_async:
             res = await pipe(
                 user_message=user_message,
                 model_id=pipeline_id,
@@ -822,9 +881,9 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                 if isinstance(res, str):
                     message = res
                 
-                # Handle async generator
                 elif inspect.isasyncgen(res):
                     async for stream in res:
+                        stream = ensure_string(stream)
                         message = f"{message}{stream}"
                 
                 logging.info(f"stream:false:async:{message}")
@@ -846,7 +905,6 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                     ],
                 }
         else:
-            # Use existing implementation for sync pipes
             def job():
                 res = pipe(
                     user_message=user_message,
@@ -868,6 +926,7 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                     
                     if isinstance(res, Generator):
                         for stream in res:
+                            stream = ensure_string(stream)
                             message = f"{message}{stream}"
                     
                     logging.info(f"stream:false:sync:{message}")
